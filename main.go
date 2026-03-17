@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,7 @@ func main() {
 	}
 
 	http.HandleFunc("/compile", handleCompile)
+	http.HandleFunc("/convert", handleConvert)
 	http.HandleFunc("/health", handleHealth)
 
 	log.Printf("[dinq-latex] listening on :%s", port)
@@ -26,7 +28,7 @@ func main() {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok","engine":"tectonic"}`))
+	w.Write([]byte(`{"status":"ok","engine":"tectonic+libreoffice"}`))
 }
 
 func handleCompile(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +81,79 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	pdfBytes, err := os.ReadFile(pdfFile)
 	if err != nil {
 		http.Error(w, "failed to read PDF: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(pdfBytes)))
+	w.Write(pdfBytes)
+}
+
+// handleConvert converts Word (.doc/.docx) files to PDF via LibreOffice.
+// Accepts the Word file as raw POST body.
+// The caller should set the filename via query param ?filename=xxx.docx
+func handleConvert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if len(body) == 0 {
+		http.Error(w, "empty file", http.StatusBadRequest)
+		return
+	}
+
+	// Determine input filename (need correct extension for LibreOffice)
+	filename := r.URL.Query().Get("filename")
+	if filename == "" {
+		filename = "input.docx"
+	}
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".doc" && ext != ".docx" {
+		http.Error(w, "unsupported file type, only .doc and .docx are supported", http.StatusBadRequest)
+		return
+	}
+
+	tmpDir, err := os.MkdirTemp("", "word-convert-*")
+	if err != nil {
+		http.Error(w, "failed to create temp dir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	inputFile := filepath.Join(tmpDir, filename)
+	if err := os.WriteFile(inputFile, body, 0644); err != nil {
+		http.Error(w, "failed to write input file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	start := time.Now()
+
+	cmd := exec.Command("libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmpDir, inputFile)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[convert] libreoffice failed in %v: %s", time.Since(start), string(output))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		fmt.Fprintf(w, `{"error":"conversion failed","log":%q}`, string(output))
+		return
+	}
+
+	log.Printf("[convert] success in %v", time.Since(start))
+
+	// LibreOffice outputs PDF with same basename
+	baseName := strings.TrimSuffix(filename, ext)
+	pdfFile := filepath.Join(tmpDir, baseName+".pdf")
+	pdfBytes, err := os.ReadFile(pdfFile)
+	if err != nil {
+		http.Error(w, "failed to read converted PDF: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
