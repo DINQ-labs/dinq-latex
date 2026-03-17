@@ -115,6 +115,7 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 	if filename == "" {
 		filename = "input.docx"
 	}
+	ext := strings.ToLower(filepath.Ext(filename))
 
 	tmpDir, err := os.MkdirTemp("", "word-convert-*")
 	if err != nil {
